@@ -1,0 +1,1095 @@
+"use client"
+import { useState, useEffect } from "react"
+import { useRouter } from "next/navigation"
+import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Badge } from "@/components/ui/badge"
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog"
+
+import { supabase } from "@/lib/supabase"
+import { useLanguage } from "@/lib/language-context"
+import { ArrowLeft, Trophy, Users } from "lucide-react"
+import Image from "next/image"
+
+interface Category {
+  id: string
+  name_ar: string
+  name_en: string
+  image_url: string | null
+}
+
+interface Question {
+  id: string
+  category_id: string
+  question_ar: string
+  question_en: string
+  answer_ar: string
+  answer_en: string
+  diamonds: number
+  question_type?: 'text' | 'video' | 'image' | 'audio'
+  media_url?: string
+  media_duration?: number
+  answer_type?: 'text' | 'video' | 'image' | 'audio'
+  answer_media_url?: string
+  answer_media_duration?: number
+}
+
+interface PowerUp {
+  id: string
+  name: string
+  description: string
+  icon: string
+  used: boolean
+}
+
+interface GameState {
+  team1Name: string
+  team2Name: string
+  team1Score: number
+  team2Score: number
+  team1Categories: string[]
+  team2Categories: string[]
+  answeredQuestions: string[]
+  team1PowerUps: PowerUp[]
+  team2PowerUps: PowerUp[]
+  team1ConsecutiveWrong: number
+  team2ConsecutiveWrong: number
+  team1ConsecutiveRight: number
+  team2ConsecutiveRight: number
+  lastPowerUpGranted: number // Question number when last power-up was granted
+}
+
+interface ProgressRecord {
+  last_used_question_ids: string[]
+}
+
+// Shuffle array helper
+function shuffle<T>(array: T[]): T[] {
+  const arr = [...array]
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1))
+    ;[arr[i], arr[j]] = [arr[j], arr[i]]
+  }
+  return arr
+}
+
+// Get 1 question per category/diamond value with rotation system
+function getQuestionForCategoryPoint(
+  categoryId: string,
+  diamonds: number,
+  allQuestions: Question[],
+  usedQuestionIds: string[]
+): Question | null {
+  const questions = allQuestions.filter(
+    q => q.category_id === categoryId && q.diamonds === diamonds
+  )
+  
+  if (questions.length === 0) return null
+  
+  // Separate unused and used questions
+  const unusedQuestions = questions.filter(q => !usedQuestionIds.includes(q.id))
+  const usedQuestions = questions.filter(q => usedQuestionIds.includes(q.id))
+  
+  // Shuffle unused questions for variety
+  const shuffledUnused = shuffle(unusedQuestions)
+  
+  // Return first unused question, or first used question, or null
+  if (shuffledUnused.length > 0) {
+    return shuffledUnused[0]
+  } else if (usedQuestions.length > 0) {
+    return usedQuestions[0]
+  }
+  
+  return null
+}
+
+export default function GamePage() {
+  const [gameState, setGameState] = useState<GameState>({
+    team1Name: "",
+    team2Name: "",
+    team1Score: 0,
+    team2Score: 0,
+    team1Categories: [],
+    team2Categories: [],
+    answeredQuestions: [],
+    team1PowerUps: [],
+    team2PowerUps: [],
+    team1ConsecutiveWrong: 0,
+    team2ConsecutiveWrong: 0,
+    team1ConsecutiveRight: 0,
+    team2ConsecutiveRight: 0,
+    lastPowerUpGranted: 0,
+  })
+  const [categories, setCategories] = useState<Category[]>([])
+  const [questions, setQuestions] = useState<Question[]>([])
+  const [selectedQuestion, setSelectedQuestion] = useState<Question | null>(null)
+  const [showAnswer, setShowAnswer] = useState(false)
+  const [rotatedQuestionsMap, setRotatedQuestionsMap] = useState<Record<string, Question[]>>({})
+  const [currentTurn, setCurrentTurn] = useState<1 | 2 | 'finished'>(1)
+  const [nextQuestionTurn, setNextQuestionTurn] = useState<1 | 2>(1)
+  const [timeLeft, setTimeLeft] = useState(30)
+  const [timerActive, setTimerActive] = useState(false)
+  const [activePowerUp, setActivePowerUp] = useState<PowerUp | null>(null)
+  const [powerUpTeam, setPowerUpTeam] = useState<1 | 2 | null>(null)
+  const [powerUpMode, setPowerUpMode] = useState<string | null>(null)
+  const [showPowerUpAnimation, setShowPowerUpAnimation] = useState<{powerUp: PowerUp, team: 1 | 2} | null>(null)
+  const [flashTurn, setFlashTurn] = useState(false)
+  const [flashingQuestion, setFlashingQuestion] = useState<string | null>(null)
+  const router = useRouter()
+  const { language, t } = useLanguage()
+
+
+
+  // Flash turn indicator when turn changes - 3 times
+  useEffect(() => {
+    let count = 0
+    const interval = setInterval(() => {
+      setFlashTurn(prev => !prev)
+      count++
+      if (count >= 6) clearInterval(interval) // 6 toggles = 3 flashes
+    }, 500)
+    return () => clearInterval(interval)
+  }, [nextQuestionTurn])
+
+  // Timer effect
+  useEffect(() => {
+    let interval: NodeJS.Timeout
+    
+    if (timerActive && timeLeft > 0) {
+      interval = setInterval(() => {
+        setTimeLeft((prev) => {
+          if (prev <= 1) {
+            // Time's up for current team
+            if (currentTurn === 1) {
+              // Switch to team 2
+              setCurrentTurn(2)
+              setTimeLeft(30)
+              return 30
+            } else {
+              // Both teams failed, show answer
+              setCurrentTurn('finished')
+              setTimerActive(false)
+              setShowAnswer(true)
+              return 0
+            }
+          }
+          return prev - 1
+        })
+      }, 1000)
+    }
+
+    return () => {
+      if (interval) clearInterval(interval)
+    }
+  }, [timerActive, timeLeft, currentTurn])
+
+  // Load used questions from Supabase
+  const getUsedQuestions = async (): Promise<string[]> => {
+    const { data, error } = await supabase
+      .from('used_questions')
+      .select('question_id')
+      .order('used_at', { ascending: true })
+    
+    if (error) {
+      console.error('Error fetching used questions:', error)
+      return []
+    }
+    
+    return data?.map(item => item.question_id) || []
+  }
+
+  // Save used question to Supabase with validation
+  const saveUsedQuestion = async (questionId: string) => {
+    if (!questionId || typeof questionId !== 'string' || questionId.trim() === '') {
+      console.error('Invalid question ID provided')
+      return
+    }
+    
+    try {
+      const { error } = await supabase
+        .from('used_questions')
+        .insert([{ question_id: questionId.trim() }])
+      
+      if (error) {
+        console.error('Error saving used question:', error)
+      }
+    } catch (err) {
+      console.error('Failed to save used question:', err)
+    }
+  }
+
+  useEffect(() => {
+    initializeGame()
+  }, [])
+
+
+
+  // Power-up definitions
+  const createPowerUp = (id: string, name: string, description: string, icon: string): PowerUp => ({
+    id, name, description, icon, used: false
+  })
+
+  const availablePowerUps = {
+    doublePoints: createPowerUp('double', 'Double Points', '2x points for this question', '🔥'),
+    questionSwap: createPowerUp('swap', 'Question Swap', 'Replace with different same-point question', '🔄'),
+    stealTurn: createPowerUp('steal', 'Steal Turn', 'Answer opponent question', '🎯'),
+    blockQuestion: createPowerUp('block', 'Block Question', 'Click any question to eliminate it', '🚫')
+  }
+
+  // Check and grant power-ups - FAIR SYSTEM: Both teams get same power-up at same time
+  const checkPowerUpTriggers = () => {
+    const totalQuestions = gameState.answeredQuestions.length
+    
+    // GUARANTEED POWER-UPS AT SPECIFIC QUESTION NUMBERS - BOTH TEAMS GET SAME POWER-UP
+    
+    // 9th question - First power-up: Question Swap for both teams
+    if (totalQuestions === 9 && gameState.lastPowerUpGranted < 9) {
+      grantPowerUpToBothTeams([availablePowerUps.questionSwap])
+      return
+    }
+    
+    // 15th question - Second power-up: Double Points for both teams
+    if (totalQuestions === 15 && gameState.lastPowerUpGranted < 15) {
+      grantPowerUpToBothTeams([availablePowerUps.doublePoints])
+      return
+    }
+    
+    // 21st question - Third power-up: Block Question for both teams
+    if (totalQuestions === 21 && gameState.lastPowerUpGranted < 21) {
+      grantPowerUpToBothTeams([availablePowerUps.blockQuestion])
+      return
+    }
+  }
+
+  // Grant power-up to both teams - FAIR SYSTEM
+  const grantPowerUpToBothTeams = (powerUps: PowerUp[]) => {
+    setGameState(prev => {
+      const newState = { ...prev }
+      
+      powerUps.forEach(powerUp => {
+        // Check if teams don't already have this power-up and have space
+        const team1HasPowerUp = newState.team1PowerUps.find(p => p.id === powerUp.id)
+        const team2HasPowerUp = newState.team2PowerUps.find(p => p.id === powerUp.id)
+        
+        // Grant to Team 1 if they don't have it and have space
+        if (!team1HasPowerUp && newState.team1PowerUps.length < 4) {
+          newState.team1PowerUps = [...newState.team1PowerUps, { ...powerUp }]
+        }
+        
+        // Grant to Team 2 if they don't have it and have space
+        if (!team2HasPowerUp && newState.team2PowerUps.length < 4) {
+          newState.team2PowerUps = [...newState.team2PowerUps, { ...powerUp }]
+        }
+        
+        newState.lastPowerUpGranted = newState.answeredQuestions.length // Update cooldown
+      })
+      
+      // Play power-up sound
+      const audio = new Audio('/sounds/powerup.mp3')
+      audio.volume = 0.6
+      audio.play().catch(e => console.log('Audio play failed:', e))
+      
+      // Show animation for both teams
+      if (powerUps.length > 0) {
+        setShowPowerUpAnimation({ powerUp: powerUps[0], team: 1 })
+        
+        // Hide animation after 3 seconds
+        setTimeout(() => {
+          setShowPowerUpAnimation(null)
+        }, 3000)
+      }
+      
+      return newState
+    })
+  }
+
+  // Grant power-up to single team (keep for backward compatibility)
+  const grantPowerUp = (team: 1 | 2, powerUps: PowerUp[]) => {
+    setGameState(prev => {
+      const newState = { ...prev }
+      
+      powerUps.forEach(powerUp => {
+        // Check if team already has 4 power-ups or already has this power-up
+        const teamPowerUps = newState[`team${team}PowerUps`]
+        const existsOnTeam = teamPowerUps.find(p => p.id === powerUp.id)
+        
+        if (teamPowerUps.length < 4 && !existsOnTeam) {
+          newState[`team${team}PowerUps`] = [...teamPowerUps, { ...powerUp }]
+          newState.lastPowerUpGranted = newState.answeredQuestions.length // Update cooldown
+          
+          // Play power-up sound
+          const audio = new Audio('/sounds/powerup.mp3')
+          audio.volume = 0.6
+          audio.play().catch(e => console.log('Audio play failed:', e))
+          
+          // Show animation
+          setShowPowerUpAnimation({ powerUp, team })
+          
+          // Hide animation after 3 seconds
+          setTimeout(() => {
+            setShowPowerUpAnimation(null)
+          }, 3000)
+        }
+      })
+      
+      return newState
+    })
+  }
+
+  // Use power-up
+  const usePowerUp = (team: 1 | 2, powerUpId: string) => {
+    const powerUp = gameState[`team${team}PowerUps`].find(p => p.id === powerUpId && !p.used)
+    if (!powerUp) return
+
+    // Activate power-up mode
+    setActivePowerUp(powerUp)
+    setPowerUpTeam(team)
+    setPowerUpMode(powerUpId)
+    
+    // Mark as used
+    setGameState(prev => ({
+      ...prev,
+      [`team${team}PowerUps`]: prev[`team${team}PowerUps`].map(p => 
+        p.id === powerUpId ? { ...p, used: true } : p
+      )
+    }))
+  }
+
+  const initializeGame = async () => {
+    const team1Name = localStorage.getItem("team1Name") || "Team 1"
+    const team2Name = localStorage.getItem("team2Name") || "Team 2"
+    const team1Categories = JSON.parse(localStorage.getItem("team1Categories") || "[]")
+    const team2Categories = JSON.parse(localStorage.getItem("team2Categories") || "[]")
+
+    setGameState((prev) => ({
+      ...prev,
+      team1Name,
+      team2Name,
+      team1Categories,
+      team2Categories,
+    }))
+
+    const allSelectedCategories = [...team1Categories, ...team2Categories]
+
+    const { data: categoriesData, error: categoriesError } = await supabase
+      .from("categories")
+      .select("*")
+      .in("id", allSelectedCategories)
+
+    if (categoriesError) {
+      console.error("Error fetching categories:", categoriesError)
+      return
+    }
+
+    setCategories(categoriesData || [])
+
+    const { data: questionsData, error: questionsError } = await supabase
+      .from("diamond_questions")
+      .select("*")
+      .in("category_id", allSelectedCategories)
+      .order("diamonds", { ascending: false })
+
+    if (questionsError) {
+      console.error("Error fetching questions:", questionsError)
+      return
+    }
+
+    const sortedQuestions = (questionsData || []).sort((a, b) => a.id.localeCompare(b.id))
+    setQuestions(sortedQuestions)
+
+    // Get used questions from Supabase
+    const usedQuestionIds = await getUsedQuestions()
+    
+    // Pre-load questions map - Diamond system
+    const map: Record<string, Question[]> = {}
+    for (const category of categoriesData || []) {
+      // Diamond values: 10, 25, 50, 75, 100
+      for (const diamonds of [10, 25, 50, 75, 100]) {
+        const key = `${category.id}-${diamonds}`
+        const question = getQuestionForCategoryPoint(category.id, diamonds, sortedQuestions, usedQuestionIds)
+        map[key] = question ? [question] : []
+      }
+    }
+    setRotatedQuestionsMap(map)
+  }
+
+  const handleQuestionClick = (question: Question) => {
+    if (gameState.answeredQuestions.includes(question.id)) return
+    
+    // Handle power-up modes
+    if (powerUpMode === 'block') {
+      // Block/eliminate the question
+      setGameState(prev => ({
+        ...prev,
+        answeredQuestions: [...prev.answeredQuestions, question.id]
+      }))
+      setPowerUpMode(null)
+      setActivePowerUp(null)
+      setPowerUpTeam(null)
+      return
+    }
+    
+    if (powerUpMode === 'swap') {
+      // Replace with different question of same category and same diamonds
+      const sameDiamondQuestions = questions.filter(q => 
+        q.category_id === question.category_id &&
+        q.diamonds === question.diamonds && 
+        q.id !== question.id &&
+        !gameState.answeredQuestions.includes(q.id)
+      )
+      if (sameDiamondQuestions.length > 0) {
+        const randomQuestion = sameDiamondQuestions[Math.floor(Math.random() * sameDiamondQuestions.length)]
+        // Update the rotated questions map
+        const key = `${question.category_id}-${question.diamonds}`
+        setRotatedQuestionsMap(prev => {
+          const updated = { ...prev }
+          if (updated[key]) {
+            updated[key] = updated[key].map(q => q.id === question.id ? randomQuestion : q)
+          }
+          return updated
+        })
+        // Flash the replaced question
+        setFlashingQuestion(key)
+        setTimeout(() => setFlashingQuestion(null), 1000)
+      }
+      setPowerUpMode(null)
+      setActivePowerUp(null)
+      setPowerUpTeam(null)
+      return
+    }
+    
+    // Normal question selection
+    setSelectedQuestion(question)
+    setShowAnswer(false)
+    setCurrentTurn(1) // Always start with team 1
+    setTimeLeft(30)
+    setTimerActive(true)
+  }
+
+
+
+
+
+  const handleShowAnswer = () => {
+    setShowAnswer(true)
+    setTimerActive(false)
+  }
+
+  const handleAnswerResult = (teamNumber: number) => {
+    if (!selectedQuestion) return
+
+    // Apply power-up effects
+    let finalDiamonds = selectedQuestion.diamonds
+    if (activePowerUp?.id === 'double' && powerUpTeam === teamNumber) {
+      finalDiamonds *= 2
+    }
+
+    const finalTeam1Score = teamNumber === 1 ? gameState.team1Score + finalDiamonds : gameState.team1Score
+    const finalTeam2Score = teamNumber === 2 ? gameState.team2Score + finalDiamonds : gameState.team2Score
+
+    // Update consecutive counters
+    const updateConsecutive = (prev: GameState) => {
+      if (teamNumber === 1) {
+        return {
+          ...prev,
+          team1ConsecutiveRight: prev.team1ConsecutiveRight + 1,
+          team1ConsecutiveWrong: 0,
+          team2ConsecutiveWrong: prev.team2ConsecutiveWrong + 1
+        }
+      } else if (teamNumber === 2) {
+        return {
+          ...prev,
+          team2ConsecutiveRight: prev.team2ConsecutiveRight + 1,
+          team2ConsecutiveWrong: 0,
+          team1ConsecutiveWrong: prev.team1ConsecutiveWrong + 1
+        }
+      } else {
+        return {
+          ...prev,
+          team1ConsecutiveWrong: prev.team1ConsecutiveWrong + 1,
+          team2ConsecutiveWrong: prev.team2ConsecutiveWrong + 1,
+          team1ConsecutiveRight: 0,
+          team2ConsecutiveRight: 0
+        }
+      }
+    }
+
+    // Mark as answered in state
+    setGameState((prev) => {
+      const updated = updateConsecutive(prev)
+      return {
+        ...updated,
+        team1Score: finalTeam1Score,
+        team2Score: finalTeam2Score,
+        answeredQuestions: [...prev.answeredQuestions, selectedQuestion.id],
+      }
+    })
+
+    // Save question as used in Supabase
+    saveUsedQuestion(selectedQuestion.id)
+
+    // Reset timer and close dialog
+    setTimerActive(false)
+    setSelectedQuestion(null)
+    setShowAnswer(false)
+    setCurrentTurn(1)
+    setTimeLeft(30)
+    setActivePowerUp(null)
+    setPowerUpTeam(null)
+    setPowerUpMode(null)
+    
+    // Switch to next team for next question
+    setNextQuestionTurn(nextQuestionTurn === 1 ? 2 : 1)
+    
+    // Check for new power-ups after answer
+    setTimeout(checkPowerUpTriggers, 500)
+  }
+
+  const handleBack = () => {
+    router.push("/category-selection")
+  }
+
+  const handleFinishGame = () => {
+    localStorage.setItem("finalTeam1Score", gameState.team1Score.toString())
+    localStorage.setItem("finalTeam2Score", gameState.team2Score.toString())
+    router.push("/results")
+  }
+
+  const getCategoryName = (category: Category) => {
+    return language === "ar" ? category.name_ar : category.name_en
+  }
+
+  const getQuestionText = (question: Question) => {
+    return language === "ar" ? question.question_ar : question.question_en
+  }
+
+  const getAnswerText = (question: Question) => {
+    return language === "ar" ? question.answer_ar : question.answer_en
+  }
+
+  // Helper function to detect if text contains Arabic characters
+  const isArabicText = (text: string) => {
+    const arabicRegex = /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/
+    return arabicRegex.test(text)
+  }
+
+  // Get text direction based on content
+  const getTextDirection = (text: string) => {
+    return isArabicText(text) ? 'rtl' : 'ltr'
+  }
+
+  return (
+    <div className="min-h-screen bg-white p-4 sm:p-8" style={{
+      backgroundImage: 'linear-gradient(rgba(255, 255, 255, 0.5), rgba(255, 255, 255, 0.9)), url(/JW.png)',
+      backgroundSize: 'contain',
+      backgroundPosition: 'top center',
+      backgroundRepeat: 'no-repeat',
+    }}>
+      <div className="max-w-7xl mx-auto">
+            {/* Mobile Layout */}
+            <div className="block sm:hidden mb-4">
+              {/* Turn Indicator */}
+              <div className="text-center mb-3">
+                <div className={`inline-flex items-center px-4 py-2 bg-gradient-to-r from-blue-500 to-blue-700 rounded-lg shadow-lg transition-all duration-300 ${
+                  flashTurn ? 'scale-110 shadow-2xl' : 'scale-100'
+                }`}>
+                  <span className="text-sm font-bold text-white">
+                    Turn: {gameState[`team${nextQuestionTurn}Name`]}
+                  </span>
+                </div>
+              </div>
+              
+              {/* Teams Row */}
+              <div className="grid grid-cols-2 gap-2">
+                {/* Team 1 */}
+                <div className="text-center">
+                  <div className={`relative overflow-hidden p-2 rounded-xl transition-all duration-300 ${
+                    nextQuestionTurn === 1 
+                      ? 'bg-gradient-to-br from-blue-500 to-blue-700 shadow-lg scale-105' 
+                      : 'bg-gradient-to-br from-gray-400 to-gray-600 shadow-md'
+                  }`}>
+                    <div className="absolute top-0 right-0 w-16 h-16 bg-white/10 rounded-full -translate-y-8 translate-x-8"></div>
+                    <div className="relative z-10">
+                      <div className="flex items-center justify-center gap-1 mb-1">
+                        <Users className="w-3 h-3 text-white" />
+                        <h2 className="text-xs font-bold text-white truncate">
+                          {gameState.team1Name}
+                        </h2>
+                      </div>
+                      <div className="text-sm font-bold text-white flex items-center justify-center gap-1">
+                        <span>💎</span>
+                        <span>{gameState.team1Score}</span>
+                      </div>
+                    </div>
+                  </div>
+                  {/* Team 1 Power-ups */}
+                  <div className="flex gap-1 mt-1 justify-center">
+                    {gameState.team1PowerUps.map((powerUp) => (
+                      <Button
+                        key={powerUp.id}
+                        size="sm"
+                        variant={powerUp.used ? "secondary" : (powerUpMode === powerUp.id ? "destructive" : "default")}
+                        disabled={powerUp.used}
+                        onClick={() => usePowerUp(1, powerUp.id)}
+                        className="text-sm px-2 py-1 h-8 w-8"
+                        title={powerUp.description}
+                        aria-label={`${powerUp.name}: ${powerUp.description}`}
+                      >
+                        {powerUp.icon}
+                      </Button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Team 2 */}
+                <div className="text-center">
+                  <div className={`relative overflow-hidden p-2 rounded-xl transition-all duration-300 ${
+                    nextQuestionTurn === 2 
+                      ? 'bg-gradient-to-br from-blue-500 to-blue-700 shadow-2xl scale-105' 
+                      : 'bg-gradient-to-br from-gray-400 to-gray-600 shadow-md'
+                  }`}>
+                    <div className="absolute top-0 right-0 w-16 h-16 bg-white/10 rounded-full -translate-y-8 translate-x-8"></div>
+                    <div className="relative z-10">
+                      <div className="flex items-center justify-center gap-1 mb-1">
+                        <Users className="w-3 h-3 text-white" />
+                        <h2 className="text-xs font-bold text-white truncate">
+                          {gameState.team2Name}
+                        </h2>
+                      </div>
+                      <div className="text-sm font-bold text-white flex items-center justify-center gap-1">
+                        <span>💎</span>
+                        <span>{gameState.team2Score}</span>
+                      </div>
+                    </div>
+                  </div>
+                  {/* Team 2 Power-ups */}
+                  <div className="flex gap-1 mt-1 justify-center">
+                    {gameState.team2PowerUps.map((powerUp) => (
+                      <Button
+                        key={powerUp.id}
+                        size="sm"
+                        variant={powerUp.used ? "secondary" : (powerUpMode === powerUp.id ? "destructive" : "default")}
+                        disabled={powerUp.used}
+                        onClick={() => usePowerUp(2, powerUp.id)}
+                        className="text-sm px-2 py-1 h-8 w-8"
+                        title={powerUp.description}
+                        aria-label={`${powerUp.name}: ${powerUp.description}`}
+                      >
+                        {powerUp.icon}
+                      </Button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Desktop Layout */}
+            <div className="hidden sm:flex justify-between items-center mb-2 sm:mb-3">
+              {/* Turn Indicator - Center */}
+              <div className="absolute left-1/2 transform -translate-x-1/2">
+                <div className={`inline-flex items-center px-6 py-3 bg-gradient-to-r from-blue-500 to-blue-700 rounded-lg shadow-2xl transition-all duration-300 ${
+                  flashTurn ? 'scale-110 shadow-3xl' : 'scale-100'
+                }`}>
+                  <span className="text-lg font-bold text-white">
+                    {language === 'ar' ? (
+                      <>
+                        <span dir="ltr">{gameState[`team${nextQuestionTurn}Name`]}</span> :دور فريق
+                      </>
+                    ) : (
+                      <>Turn: {gameState[`team${nextQuestionTurn}Name`]}</>
+                    )}
+                  </span>
+                </div>
+              </div>
+              {/* Team 1 */}
+              <div className="text-center">
+                <div className={`relative overflow-hidden p-4 rounded-2xl transition-all duration-300 ${
+                  nextQuestionTurn === 1 
+                    ? 'bg-gradient-to-br from-blue-500 to-blue-700 shadow-2xl scale-105' 
+                    : 'bg-gradient-to-br from-gray-400 to-gray-600 shadow-lg'
+                }`}>
+                  <div className="absolute top-0 right-0 w-24 h-24 bg-white/10 rounded-full -translate-y-12 translate-x-12"></div>
+                  <div className="relative z-10">
+                    <div className="flex items-center justify-center gap-2 mb-2">
+                      <Users className="w-5 h-5 text-white" />
+                      <h2 className="text-lg sm:text-xl font-bold text-white">
+                        {gameState.team1Name}
+                      </h2>
+                    </div>
+                    <div className="text-xl sm:text-2xl font-bold text-white flex items-center justify-center gap-2">
+                      <span>💎</span>
+                      <span>{gameState.team1Score}</span>
+                    </div>
+                  </div>
+                </div>
+                {/* Team 1 Power-ups */}
+                <div className="flex flex-wrap gap-1 mt-2 justify-center">
+                  {gameState.team1PowerUps.map((powerUp) => (
+                    <Button
+                      key={powerUp.id}
+                      size="sm"
+                      variant={powerUp.used ? "secondary" : (powerUpMode === powerUp.id ? "destructive" : "default")}
+                      disabled={powerUp.used}
+                      onClick={() => usePowerUp(1, powerUp.id)}
+                      className="text-lg px-3 py-2 h-10 w-10"
+                      title={powerUp.description}
+                      aria-label={`${powerUp.name}: ${powerUp.description}`}
+                    >
+                      {powerUp.icon}
+                    </Button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Team 2 */}
+              <div className="text-center">
+                <div className={`relative overflow-hidden p-4 rounded-2xl transition-all duration-300 ${
+                  nextQuestionTurn === 2 
+                    ? 'bg-gradient-to-br from-blue-500 to-blue-700 shadow-2xl scale-105' 
+                    : 'bg-gradient-to-br from-gray-400 to-gray-600 shadow-lg'
+                }`}>
+                  <div className="absolute top-0 right-0 w-24 h-24 bg-white/10 rounded-full -translate-y-12 translate-x-12"></div>
+                  <div className="relative z-10">
+                    <div className="flex items-center justify-center gap-2 mb-2">
+                      <Users className="w-5 h-5 text-white" />
+                      <h2 className="text-lg sm:text-xl font-bold text-white">
+                        {gameState.team2Name}
+                      </h2>
+                    </div>
+                    <div className="text-xl sm:text-2xl font-bold text-white flex items-center justify-center gap-2">
+                      <span>💎</span>
+                      <span>{gameState.team2Score}</span>
+                    </div>
+                  </div>
+                </div>
+                {/* Team 2 Power-ups */}
+                <div className="flex flex-wrap gap-1 mt-2 justify-center">
+                  {gameState.team2PowerUps.map((powerUp) => (
+                    <Button
+                      key={powerUp.id}
+                      size="sm"
+                      variant={powerUp.used ? "secondary" : (powerUpMode === powerUp.id ? "destructive" : "default")}
+                      disabled={powerUp.used}
+                      onClick={() => usePowerUp(2, powerUp.id)}
+                      className="text-lg px-3 py-2 h-10 w-10"
+                      title={powerUp.description}
+                      aria-label={`${powerUp.name}: ${powerUp.description}`}
+                    >
+                      {powerUp.icon}
+                    </Button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Game Board - Diamond System */}
+            <div className="grid grid-cols-2 lg:grid-cols-3 gap-3 sm:gap-4 lg:gap-6 mb-6 sm:mb-8">
+              {categories.map((category) => (
+                <Card key={category.id} className="overflow-hidden relative">
+                  <CardHeader className="bg-blue-800 text-white text-center py-2 sm:py-4 relative z-10 min-h-[3rem] sm:min-h-[4rem] flex items-center justify-center">
+                    <CardTitle className="text-sm sm:text-lg lg:text-xl font-bold line-clamp-2 leading-tight">{getCategoryName(category)}</CardTitle>
+                  </CardHeader>
+                  <CardContent className="p-0 relative" style={{
+                    backgroundImage: category.image_url ? `url(${category.image_url})` : 'none',
+                    backgroundSize: 'cover',
+                    backgroundPosition: 'center',
+                    backgroundRepeat: 'no-repeat'
+                  }}>
+                    {/* Reduce image opacity with overlay */}
+                    {category.image_url && (
+                      <div className="absolute inset-0 bg-white/80"></div>
+                    )}
+
+                    {/* Single Column - Diamond Levels */}
+                    <div className="space-y-0">
+                      {[10, 25, 50, 75, 100].map((diamonds) => {
+                        const key = `${category.id}-${diamonds}`
+                        const available = rotatedQuestionsMap[key] || []
+                        const question = available[0] || null
+                        const isAnswered = question ? gameState.answeredQuestions.includes(question.id) : true
+                        const isFlashing = flashingQuestion === key
+
+                        return (
+                          <Button
+                            key={key}
+                            variant="outline"
+                            disabled={isAnswered || !question}
+                            onClick={() => question && handleQuestionClick(question)}
+                            className={`w-full h-10 sm:h-12 text-base sm:text-lg font-bold rounded-none border-gray-200 hover:bg-blue-50/80 disabled:bg-gray-100/80 disabled:text-gray-400 flex items-center justify-center gap-2 relative z-10 bg-white/85 backdrop-blur-sm transition-all ${
+                              isFlashing ? 'animate-pulse bg-yellow-200/90 scale-105 shadow-lg' : ''
+                            }`}
+                          >
+                            {isAnswered ? (
+                              <span className="text-green-600">✓</span>
+                            ) : (
+                              <>
+                                <span className="text-blue-600">💎</span>
+                                <span className="w-8 text-center">{diamonds}</span>
+                              </>
+                            )}
+                          </Button>
+                        )
+                      })}
+                    </div>
+                  </CardContent>
+                </Card>
+              ))}
+            </div>
+
+            {/* Game Control Buttons */}
+            <div className="flex justify-center gap-4">
+              <Button
+                onClick={handleBack}
+                variant="outline"
+                className="px-4 sm:px-6 py-2 bg-gray-600 text-white border-gray-600 hover:bg-gray-700 rounded-lg"
+              >
+                <ArrowLeft className="w-4 h-4 mr-2" />
+                {t("back_to_categories")}
+              </Button>
+              <Button
+                onClick={handleFinishGame}
+                className="px-6 sm:px-8 py-3 bg-blue-800 hover:bg-blue-700 text-white rounded-lg font-semibold"
+              >
+                <Trophy className="w-4 h-4 mr-2" />
+                {t("finish_game")}
+              </Button>
+            </div>
+
+            {/* Power-up Animation */}
+            {showPowerUpAnimation && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center pointer-events-none">
+                <div className="animate-bounce">
+                  <div className="bg-yellow-400 rounded-full p-8 shadow-2xl animate-pulse">
+                    <div className="text-8xl animate-spin">
+                      {showPowerUpAnimation.powerUp.icon}
+                    </div>
+                  </div>
+                </div>
+                <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2">
+                  <div className="bg-white rounded-lg p-4 shadow-xl animate-pulse">
+                    <h3 className="text-2xl font-bold text-center text-yellow-600">
+                      🎉 POWER-UP GRANTED! 🎉
+                    </h3>
+                    <p className="text-lg text-center mt-2">
+                      <strong>{gameState[`team${showPowerUpAnimation.team}Name`]}</strong> got <strong>{showPowerUpAnimation.powerUp.name}</strong>!
+                    </p>
+                  </div>
+                </div>
+                
+                {/* Flying animation to team */}
+                <div 
+                  className={`absolute text-4xl animate-ping ${
+                    showPowerUpAnimation.team === 1 
+                      ? 'top-20 left-20 animate-bounce' 
+                      : 'top-20 right-20 animate-bounce'
+                  }`}
+                  style={{
+                    animation: `flyToTeam${showPowerUpAnimation.team} 2s ease-out 1s forwards`
+                  }}
+                >
+                  {showPowerUpAnimation.powerUp.icon}
+                </div>
+              </div>
+            )}
+            
+            <style jsx>{`
+              @keyframes flyToTeam1 {
+                0% { transform: translate(0, 0) scale(1); }
+                50% { transform: translate(-200px, -100px) scale(0.5); }
+                100% { transform: translate(-400px, -200px) scale(0.2); opacity: 0; }
+              }
+              @keyframes flyToTeam2 {
+                0% { transform: translate(0, 0) scale(1); }
+                50% { transform: translate(200px, -100px) scale(0.5); }
+                100% { transform: translate(400px, -200px) scale(0.2); opacity: 0; }
+              }
+            `}</style>
+
+            {/* Question Dialog */}
+            <Dialog open={!!selectedQuestion} onOpenChange={() => setSelectedQuestion(null)}>
+              <DialogContent className="max-w-4xl w-[95vw] max-h-[90vh] overflow-y-auto rounded-xl" aria-describedby="question-dialog-description">
+                <DialogHeader className="border-b pb-4">
+                  <DialogTitle className="text-center text-xl sm:text-2xl font-bold">
+                    {selectedQuestion && (
+                      <span className="flex items-center justify-center gap-2">
+                        <span>💎</span>
+                        <span>{selectedQuestion.diamonds} Diamonds</span>
+                      </span>
+                    )}
+                  </DialogTitle>
+                  <DialogDescription className="sr-only">
+                    Question and answer dialog for the quiz game
+                  </DialogDescription>
+                </DialogHeader>
+                {selectedQuestion && (
+                  <div className="space-y-4 sm:space-y-6 p-2 sm:p-4">
+                    {/* Timer and Turn Indicator - Centered */}
+                    {!showAnswer && (
+                      <div className="flex flex-col items-center gap-3">
+                        {/* Circular Timer - Centered */}
+                        <div 
+                          className={`relative w-20 h-20 sm:w-24 sm:h-24 cursor-pointer ${timeLeft <= 10 ? 'animate-pulse' : ''}`}
+                          onClick={() => setTimerActive(!timerActive)}
+                          title={timerActive ? "Click to pause timer" : "Click to resume timer"}
+                        >
+                          <svg className="w-full h-full transform -rotate-90" viewBox="0 0 64 64">
+                            <circle cx="32" cy="32" r="28" fill="none" stroke="#e5e7eb" strokeWidth="4" />
+                            <circle
+                              cx="32" cy="32" r="28" fill="none"
+                              stroke={timeLeft <= 10 ? '#ef4444' : '#3b82f6'}
+                              strokeWidth="4" strokeLinecap="round"
+                              strokeDasharray={`${2 * Math.PI * 28}`}
+                              strokeDashoffset={`${2 * Math.PI * 28 * (1 - timeLeft / 30)}`}
+                              className="transition-all duration-1000"
+                            />
+                          </svg>
+                          <div className="absolute inset-0 flex items-center justify-center">
+                            <span className={`text-xl sm:text-2xl font-bold ${timeLeft <= 10 ? 'text-red-500' : 'text-blue-600'}`}>
+                              {timeLeft}
+                            </span>
+                          </div>
+                        </div>
+                        
+                        {/* Turn Indicator */}
+                        <div className="bg-blue-50 border-2 border-blue-300 rounded-lg px-4 py-2 sm:px-6 sm:py-3">
+                          <div className="text-base sm:text-lg font-bold text-blue-800 text-center">
+                            {currentTurn === 'finished' ? (language === 'ar' ? 'انتهى الوقت!' : 'Time\'s Up!') : 
+                             language === 'ar' ? (
+                               <>
+                                 <span dir="ltr">{currentTurn === 1 ? gameState.team1Name : gameState.team2Name}</span> دور
+                               </>
+                             ) : (
+                               currentTurn === 1 ? `${gameState.team1Name}'s Turn` : `${gameState.team2Name}'s Turn`
+                             )}
+                          </div>
+                        </div>
+                        
+                        {/* Active Power-up */}
+                        {activePowerUp && (
+                          <div className="bg-yellow-50 border-2 border-yellow-300 rounded-lg px-4 py-2">
+                            <span className="text-sm sm:text-base font-bold text-yellow-800">
+                              {activePowerUp.icon} {activePowerUp.name} Active!
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    
+                    {/* Question Section */}
+                    <div className="bg-gradient-to-br from-blue-50 to-indigo-50 border-2 border-blue-200 rounded-xl p-4 sm:p-6 shadow-inner">
+                      <div className="flex items-center justify-center mb-3">
+                        <span className="text-blue-600 font-semibold text-sm sm:text-base">Question</span>
+                      </div>
+                      <p
+                        className="text-base sm:text-xl font-medium text-gray-800 break-words whitespace-normal leading-relaxed text-center"
+                        dir={getTextDirection(getQuestionText(selectedQuestion))}
+                      >
+                        {getQuestionText(selectedQuestion)}
+                      </p>
+                      
+                      {selectedQuestion.media_url && !showAnswer && (
+                        <div className="mt-4">
+                          {selectedQuestion.question_type === 'image' && (
+                            <div className="flex justify-center">
+                              <Image src={selectedQuestion.media_url} alt="Question image" width={400} height={0} className="rounded-lg object-cover max-w-full h-auto shadow-md" />
+                            </div>
+                          )}
+                          {selectedQuestion.question_type === 'video' && (
+                            <div className="flex justify-center">
+                              <video src={selectedQuestion.media_url} controls className="rounded-lg max-w-full h-auto max-h-48 md:max-h-64 shadow-md">Your browser does not support the video tag.</video>
+                            </div>
+                          )}
+                          {selectedQuestion.question_type === 'audio' && (
+                            <div className="flex justify-center">
+                              <audio src={selectedQuestion.media_url} controls className="w-full max-w-md">Your browser does not support the audio tag.</audio>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Answer Section with fade-in animation */}
+                    {showAnswer && (
+                      <div className="bg-gradient-to-br from-green-50 to-emerald-50 border-2 border-green-300 rounded-xl p-4 sm:p-6 shadow-inner animate-in fade-in duration-500">
+                        <div className="flex items-center justify-center mb-3">
+                          <span className="text-green-600 font-semibold text-sm sm:text-base">Answer</span>
+                        </div>
+                        <p
+                          className="text-base sm:text-xl font-bold text-green-800 break-words whitespace-normal leading-relaxed text-center"
+                          dir={getTextDirection(getAnswerText(selectedQuestion))}
+                        >
+                          {getAnswerText(selectedQuestion)}
+                          {activePowerUp?.id === 'double' && (
+                            <span className="ml-2 text-red-600">🔥 (Double Diamonds!)</span>
+                          )}
+                        </p>
+                        
+                        {selectedQuestion.answer_media_url && (
+                          <div className="mt-4">
+                            {selectedQuestion.answer_type === 'image' && (
+                              <div className="flex justify-center">
+                                <Image src={selectedQuestion.answer_media_url} alt="Answer image" width={400} height={0} className="rounded-lg object-cover max-w-full h-auto shadow-md" />
+                              </div>
+                            )}
+                            {selectedQuestion.answer_type === 'video' && (
+                              <div className="flex justify-center">
+                                <video src={selectedQuestion.answer_media_url} controls autoPlay className="rounded-lg max-w-full h-auto max-h-48 md:max-h-64 shadow-md">Your browser does not support the video tag.</video>
+                              </div>
+                            )}
+                            {selectedQuestion.answer_type === 'audio' && (
+                              <div className="flex justify-center">
+                                <audio src={selectedQuestion.answer_media_url} controls autoPlay className="w-full max-w-md">Your browser does not support the audio tag.</audio>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Action Buttons */}
+                    <div className="space-y-3 pt-2">
+                      {!showAnswer ? (
+                        <div className="space-y-2">
+                          <Button onClick={handleShowAnswer} className="w-full h-12 sm:h-14 text-base sm:text-lg font-semibold bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 shadow-lg">
+                            Show Answer
+                          </Button>
+                          {currentTurn === 'finished' && (
+                            <div className="text-center text-red-600 font-bold text-sm sm:text-base">
+                              Both teams ran out of time!
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="flex flex-col gap-3">
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4">
+                            <Button
+                              onClick={() => handleAnswerResult(1)}
+                              className="h-16 sm:h-18 bg-gradient-to-r from-blue-500 to-blue-600 hover:from-blue-600 hover:to-blue-700 text-white font-bold text-base sm:text-lg shadow-lg transition-all hover:scale-105"
+                            >
+                              <span className="break-words text-center leading-tight">{gameState.team1Name}</span>
+                            </Button>
+                            <Button
+                              onClick={() => handleAnswerResult(2)}
+                              className="h-16 sm:h-18 bg-gradient-to-r from-blue-500 to-blue-600 hover:from-blue-600 hover:to-blue-700 text-white font-bold text-base sm:text-lg shadow-lg transition-all hover:scale-105"
+                            >
+                              <span className="break-words text-center leading-tight">{gameState.team2Name}</span>
+                            </Button>
+                          </div>
+                          <Button
+                            onClick={() => handleAnswerResult(0)}
+                            variant="outline"
+                            className="h-12 sm:h-14 text-base sm:text-lg font-semibold border-2 hover:bg-gray-100"
+                          >
+                            {t("no_one")}
+                          </Button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </DialogContent>
+            </Dialog>
+      </div>
+    </div>
+  )
+}
