@@ -1,12 +1,12 @@
 import { supabase } from './supabase'
 import { sanitizeInput } from './sanitize'
-import { handleError, validateInput } from './error-handler'
+import { validateInput } from './error-handler'
 import { sessionManager } from './session-manager'
 
 export const logActivity = async (
   adminEmail: string,
-  action: 'create' | 'update' | 'delete' | 'login' | 'logout' | 'access_denied',
-  resourceType: 'category' | 'question' | 'auth' | 'file',
+  action: 'create' | 'update' | 'delete' | 'approve' | 'reject' | 'import',
+  resourceType: 'category' | 'question' | 'admin_request' | 'bulk_import' | 'settings',
   resourceId: string,
   resourceName: string,
   details?: any
@@ -14,9 +14,8 @@ export const logActivity = async (
   try {
     // Validate inputs
     const validatedEmail = validateInput(adminEmail, 'Admin email')
-    const validatedResourceId = validateInput(resourceId, 'Resource ID')
     const validatedResourceName = validateInput(resourceName, 'Resource name')
-    
+
     // Get session info for enhanced logging
     const session = sessionManager.getSession()
     const enhancedDetails = {
@@ -24,52 +23,50 @@ export const logActivity = async (
       timestamp: new Date().toISOString(),
       user_agent: typeof navigator !== 'undefined' ? navigator.userAgent : 'server',
       session_id: session?.userId || 'anonymous',
-      ip_address: 'client-side', // Would be populated server-side
-      severity: getSeverityLevel(action, resourceType)
     }
-    
-    const { error } = await supabase
-      .from('activity_logs')
-      .insert([{
+
+    const { error } = await supabase.from('activity_logs').insert([
+      {
         admin_email: sanitizeInput(validatedEmail),
         action,
         resource_type: resourceType,
-        resource_id: sanitizeInput(validatedResourceId),
+        resource_id: resourceId ? sanitizeInput(resourceId) : null,
         resource_name: sanitizeInput(validatedResourceName),
-        details: enhancedDetails
-      }])
+        details: enhancedDetails,
+      },
+    ])
 
     if (error) {
-      handleError(error, 'Activity logging')
+      console.error('Activity logging failed:', error)
     }
   } catch (err) {
-    handleError(err, 'Activity logging')
+    console.error('Activity logging error:', err)
   }
 }
 
 // Enhanced logging functions
 export const logSecurityEvent = async (
   adminEmail: string,
-  event: 'login_attempt' | 'login_success' | 'login_failed' | 'access_denied' | 'rate_limit_exceeded',
+  event:
+    | 'login_attempt'
+    | 'login_success'
+    | 'login_failed'
+    | 'access_denied'
+    | 'rate_limit_exceeded',
   details?: any
 ) => {
   try {
-    // Use the same pattern as existing logActivity function
-    const { error } = await supabase
-      .from('activity_logs')
-      .insert({
-        admin_email: adminEmail || 'unknown',
-        action: 'create', // Use only 'create' which should be allowed
-        resource_type: 'category', // Use 'category' which should be allowed
-        resource_id: 'security-event',
-        resource_name: event,
-        details: { event, ...details }
-      })
+    const { error } = await supabase.from('activity_logs').insert({
+      admin_email: adminEmail || 'unknown',
+      action: 'create',
+      resource_type: 'settings',
+      resource_id: 'security-event',
+      resource_name: event,
+      details: { event, ...details },
+    })
 
     if (error) {
-      // Sanitize error message before logging to prevent log injection
-      const sanitizedMessage = error.message ? error.message.replace(/[\r\n\t]/g, ' ').substring(0, 200) : 'Unknown error'
-      console.error('Security logging failed:', sanitizedMessage)
+      console.error('Security logging failed:', error.message)
     }
   } catch (err) {
     console.error('Security logging error:', err)
@@ -82,15 +79,15 @@ export const logFileOperation = async (
   fileName: string,
   details?: any
 ) => {
-  await logActivity(adminEmail, operation === 'upload' ? 'create' : 'delete', 'file', fileName, fileName, {
-    ...details,
-    file_operation: true
-  })
-}
-
-function getSeverityLevel(action: string, resourceType: string): 'low' | 'medium' | 'high' {
-  if (action === 'delete') return 'high'
-  if (resourceType === 'auth') return 'high'
-  if (action === 'create') return 'medium'
-  return 'low'
+  await logActivity(
+    adminEmail,
+    operation === 'upload' ? 'create' : 'delete',
+    'settings',
+    fileName,
+    fileName,
+    {
+      ...details,
+      file_operation: true,
+    }
+  )
 }
