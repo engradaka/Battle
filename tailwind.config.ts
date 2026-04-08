@@ -62,7 +62,15 @@ const config: Config = {
   				'accent-foreground': 'hsl(var(--sidebar-accent-foreground))',
   				border: 'hsl(var(--sidebar-border))',
   				ring: 'hsl(var(--sidebar-ring))'
-  			}
+  			},
+            blue: {
+                  500: '#1a5fa8',
+                  600: '#0c3d71',
+                  700: '#0a3260',
+                  800: '#091e3a',
+                  900: '#060f1d',
+            },
+
   		},
   		borderRadius: {
   			lg: 'var(--radius)',
