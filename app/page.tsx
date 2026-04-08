@@ -16,7 +16,7 @@ export default function HomePage() {
     setIsMounted(true)
   }, [])
 
-/*************  ✨ Windsurf Command ⭐  *************/
+
 /*******  c63cce74-76c8-4aae-94f2-08b74391db0c  *******/  const handleStartChallenge = () => {
     router.push("/team-setup")
   }
@@ -84,7 +84,7 @@ export default function HomePage() {
                 <p className="text-gray-600 mb-6">{t("description")}</p>
                 <Button
                   onClick={handleStartChallenge}
-                  className="w-full h-14 bg-gradient-to-r from-blue-800 to-blue-600 hover:from-blue-700 hover:to-blue-500 text-white font-bold text-lg shadow-lg hover:shadow-xl transition-all hover:scale-105"
+                  className="w-full h-14 bg-gradient-to-r from-#0c3d71 hover:from-blue-700 hover:to-blue-500 text-white font-bold text-lg shadow-lg hover:shadow-xl transition-all hover:scale-105"
                 >
                   {t("start_challenge")}
                 </Button>
