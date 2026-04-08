@@ -84,7 +84,7 @@ export default function HomePage() {
                 <p className="text-gray-600 mb-6">{t("description")}</p>
                 <Button
                   onClick={handleStartChallenge}
-                    className="w-full h-14 bg-0c3d71 hover:bg-0c3d71 text-white font-bold text-lg shadow-lg hover:shadow-xl transition-all hover:scale-105"
+                    className="w-full h-14 bg-var(--color-primary) hover:bg-var(--color-primary) text-white font-bold text-lg shadow-lg hover:shadow-xl transition-all hover:scale-105"
                   >
                   {t("start_challenge")}
                 </Button>
